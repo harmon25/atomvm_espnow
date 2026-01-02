@@ -15,19 +15,27 @@
 
 #include "atomvm_espnow.h"
 
+// Logging style aligned with atomvm_led_strip:
+// - Use TRACE(...) for verbose/debug messages (typically compiled out unless enabled).
+// - Use ESP_LOG* sparingly for key lifecycle/error messages.
+
 #ifdef ESP_PLATFORM
-#include "esp_log.h"
-static const char *TAG = "atomvm_espnow_nif";
-#define NIF_LOGI(fmt, ...) ESP_LOGI(TAG, fmt, ##__VA_ARGS__)
-#define NIF_LOGW(fmt, ...) ESP_LOGW(TAG, fmt, ##__VA_ARGS__)
-#define NIF_LOGE(fmt, ...) ESP_LOGE(TAG, fmt, ##__VA_ARGS__)
+#include <esp_log.h>
+#define TAG "atomvm_espnow"
 #else
-#define NIF_LOGI(fmt, ...) do { (void) (fmt); } while (0)
-#define NIF_LOGW(fmt, ...) do { (void) (fmt); } while (0)
-#define NIF_LOGE(fmt, ...) do { (void) (fmt); } while (0)
+#define TAG "atomvm_espnow"
 #endif
 
-static bool s_logged_nif_loaded = false;
+#if defined(ESP_PLATFORM) && defined(__has_include)
+    #if __has_include("trace.h")
+        // Provided by AtomVM platforms (e.g., ESP32 build).
+        #include "trace.h"
+    #else
+        #define TRACE(...) do { } while (0)
+    #endif
+#else
+    #define TRACE(...) do { } while (0)
+#endif
 
 static const char *const not_supported_atom = "\xD" "not_supported";
 static const char *const broadcast_atom = "\x9" "broadcast";
@@ -80,14 +88,18 @@ static term nif_init(Context *ctx, int argc, term argv[])
     avm_espnow_handle_t *handle = NULL;
     esp_err_t err = avm_espnow_new(&config, &handle);
     if (err != ESP_OK) {
-        NIF_LOGE("nif_init failed err=%d", (int) err);
+#ifdef ESP_PLATFORM
+        ESP_LOGE(TAG, "nif_init failed err=%d", (int) err);
+#endif
         if (err == ESP_ERR_INVALID_STATE) {
             return make_error_tuple(ctx, globalcontext_make_atom(ctx->global, busy_atom));
         }
         return make_error_tuple(ctx, term_from_int(err));
     }
 
-    NIF_LOGI("nif_init ok channel=%d handle=%p", (int) channel, (void *) handle);
+#ifdef ESP_PLATFORM
+    ESP_LOGI(TAG, "ESPNOW initialized");
+#endif
 
     return ptr_to_binary(handle, ctx);
 }
@@ -101,17 +113,15 @@ static term nif_deinit(Context *ctx, int argc, term argv[])
 
     avm_espnow_handle_t *handle = (avm_espnow_handle_t *) binary_to_ptr(handle_bin);
     if (!handle) {
-        NIF_LOGE("nif_deinit bad handle");
+        TRACE("nif_deinit bad handle\n");
         return make_error_tuple(ctx, BADARG_ATOM);
     }
 
     esp_err_t err = avm_espnow_del(handle);
     if (err != ESP_OK) {
-        NIF_LOGE("nif_deinit failed err=%d", (int) err);
+        TRACE("nif_deinit failed err=%d\n", (int) err);
         return make_error_tuple(ctx, term_from_int(err));
     }
-
-    NIF_LOGI("nif_deinit ok");
     return OK_ATOM;
 }
 
@@ -127,7 +137,7 @@ static term nif_add_peer(Context *ctx, int argc, term argv[])
     VALIDATE_VALUE(channel_term, term_is_integer);
 
     if (term_binary_size(mac_bin) != ESP_NOW_ETH_ALEN) {
-        NIF_LOGE("nif_add_peer bad mac size=%d", (int) term_binary_size(mac_bin));
+        TRACE("nif_add_peer bad mac size=%d\n", (int) term_binary_size(mac_bin));
         return make_error_tuple(ctx, BADARG_ATOM);
     }
 
@@ -138,7 +148,7 @@ static term nif_add_peer(Context *ctx, int argc, term argv[])
 
     avm_espnow_handle_t *handle = (avm_espnow_handle_t *) binary_to_ptr(handle_bin);
     if (!handle) {
-        NIF_LOGE("nif_add_peer bad handle");
+        TRACE("nif_add_peer bad handle\n");
         return make_error_tuple(ctx, BADARG_ATOM);
     }
 
@@ -146,11 +156,9 @@ static term nif_add_peer(Context *ctx, int argc, term argv[])
 
     esp_err_t err = avm_espnow_add_peer(handle, peer_addr, (uint8_t) channel);
     if (err != ESP_OK) {
-        NIF_LOGE("nif_add_peer failed err=%d", (int) err);
+        TRACE("nif_add_peer failed err=%d\n", (int) err);
         return make_error_tuple(ctx, term_from_int(err));
     }
-
-    NIF_LOGI("nif_add_peer ok");
 
     return OK_ATOM;
 }
@@ -167,25 +175,25 @@ static term nif_send(Context *ctx, int argc, term argv[])
 
     avm_espnow_handle_t *handle = (avm_espnow_handle_t *) binary_to_ptr(handle_bin);
     if (!handle) {
-        NIF_LOGE("nif_send bad handle");
+        TRACE("nif_send bad handle\n");
         return make_error_tuple(ctx, BADARG_ATOM);
     }
 
     const uint8_t *peer_addr_or_null = NULL;
     if (term_is_atom(to_term)) {
         if (!globalcontext_is_term_equal_to_atom_string(ctx->global, to_term, broadcast_atom)) {
-            NIF_LOGE("nif_send unsupported atom destination");
+            TRACE("nif_send unsupported atom destination\n");
             return make_error_tuple(ctx, globalcontext_make_atom(ctx->global, not_supported_atom));
         }
         peer_addr_or_null = NULL; // broadcast
     } else if (term_is_binary(to_term)) {
         if (term_binary_size(to_term) != ESP_NOW_ETH_ALEN) {
-            NIF_LOGE("nif_send bad mac size=%d", (int) term_binary_size(to_term));
+            TRACE("nif_send bad mac size=%d\n", (int) term_binary_size(to_term));
             return make_error_tuple(ctx, BADARG_ATOM);
         }
         peer_addr_or_null = (const uint8_t *) term_binary_data(to_term);
     } else {
-        NIF_LOGE("nif_send bad destination type");
+        TRACE("nif_send bad destination type\n");
         return make_error_tuple(ctx, BADARG_ATOM);
     }
 
@@ -194,7 +202,7 @@ static term nif_send(Context *ctx, int argc, term argv[])
 
     esp_err_t err = avm_espnow_send(handle, peer_addr_or_null, data, len);
     if (err != ESP_OK) {
-        NIF_LOGE("nif_send failed err=%d len=%u", (int) err, (unsigned) len);
+        TRACE("nif_send failed err=%d len=%u\n", (int) err, (unsigned) len);
         return make_error_tuple(ctx, term_from_int(err));
     }
 
@@ -210,7 +218,7 @@ static term nif_recv(Context *ctx, int argc, term argv[])
 
     avm_espnow_handle_t *handle = (avm_espnow_handle_t *) binary_to_ptr(handle_bin);
     if (!handle) {
-        NIF_LOGE("nif_recv bad handle");
+        TRACE("nif_recv bad handle\n");
         return make_error_tuple(ctx, BADARG_ATOM);
     }
 
@@ -220,7 +228,7 @@ static term nif_recv(Context *ctx, int argc, term argv[])
         return globalcontext_make_atom(ctx->global, none_atom);
     }
     if (err != ESP_OK || !rx) {
-        NIF_LOGE("nif_recv failed err=%d", (int) err);
+        TRACE("nif_recv failed err=%d\n", (int) err);
         return make_error_tuple(ctx, term_from_int(err));
     }
 
@@ -252,7 +260,7 @@ static term nif_poll(Context *ctx, int argc, term argv[])
 
     avm_espnow_handle_t *handle = (avm_espnow_handle_t *) binary_to_ptr(handle_bin);
     if (!handle) {
-        NIF_LOGE("nif_poll bad handle");
+        TRACE("nif_poll bad handle\n");
         return make_error_tuple(ctx, BADARG_ATOM);
     }
 
@@ -263,7 +271,7 @@ static term nif_poll(Context *ctx, int argc, term argv[])
         return globalcontext_make_atom(ctx->global, none_atom);
     }
     if (err != ESP_OK) {
-        NIF_LOGE("nif_poll failed err=%d", (int) err);
+        TRACE("nif_poll failed err=%d\n", (int) err);
         return make_error_tuple(ctx, term_from_int(err));
     }
 
@@ -340,49 +348,43 @@ static const struct Nif poll_nif = {
 void atomvm_espnow_init(GlobalContext *global)
 {
     UNUSED(global);
-
-    NIF_LOGI("NIF collection init");
+    // no-op
 }
 
 void atomvm_espnow_destroy(GlobalContext *global)
 {
     UNUSED(global);
-
-    NIF_LOGI("NIF collection destroy");
+    // no-op
 }
 
 const struct Nif *atomvm_espnow_get_nif(const char *nifname)
 {
-    if (UNLIKELY(!s_logged_nif_loaded)) {
-        s_logged_nif_loaded = true;
-        NIF_LOGI("NIF collection loaded (first get_nif=%s)", nifname ? nifname : "<null>");
-    }
-
-    if (UNLIKELY(!nifname)) {
-        NIF_LOGW("get_nif called with NULL");
-        return NULL;
-    }
+    TRACE("Locating nif %s ...", nifname);
 
     if (strcmp("espnow:nif_init/1", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
         return &init_nif;
     }
     if (strcmp("espnow:nif_deinit/1", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
         return &deinit_nif;
     }
     if (strcmp("espnow:nif_add_peer/3", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
         return &add_peer_nif;
     }
     if (strcmp("espnow:nif_send/3", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
         return &send_nif;
     }
     if (strcmp("espnow:nif_recv/1", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
         return &recv_nif;
     }
     if (strcmp("espnow:nif_poll/1", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
         return &poll_nif;
     }
-
-    NIF_LOGW("get_nif unresolved %s", nifname);
     return NULL;
 }
 
