@@ -42,7 +42,7 @@ static void recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, i
         return;
     }
 
-    if (data_len > ESP_NOW_MAX_DATA_LEN) {
+    if (data_len > ESP_NOW_MAX_DATA_LEN_V2) {
         ESP_LOGW(TAG, "RX len too large: %d", data_len);
         return;
     }
@@ -69,8 +69,11 @@ static void recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, i
         data_len);
 }
 
-static void send_cb(const uint8_t *mac_addr, esp_now_send_status_t status)
+static void send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
 {
+    const uint8_t *mac_addr = (tx_info && tx_info->des_addr) ? tx_info->des_addr : NULL;
+    const int tx_status = tx_info ? (int) tx_info->tx_status : (int) status;
+
     avm_espnow_handle_t *handle = s_handle;
     if (handle && handle->tx_queue) {
         avm_espnow_tx_t *tx = malloc(sizeof(avm_espnow_tx_t));
@@ -82,7 +85,7 @@ static void send_cb(const uint8_t *mac_addr, esp_now_send_status_t status)
                 tx->is_broadcast = true;
                 memset(tx->dst_addr, 0, ESP_NOW_ETH_ALEN);
             }
-            tx->status = (int) status;
+            tx->status = tx_status;
 
             if (xQueueSend(handle->tx_queue, &tx, 0) != pdTRUE) {
                 free(tx);
@@ -91,12 +94,12 @@ static void send_cb(const uint8_t *mac_addr, esp_now_send_status_t status)
     }
 
     if (!mac_addr) {
-        ESP_LOGI(TAG, "TX broadcast status=%d", (int) status);
+        ESP_LOGI(TAG, "TX broadcast status=%d", tx_status);
         return;
     }
     ESP_LOGI(TAG, "TX to %02x:%02x:%02x:%02x:%02x:%02x status=%d",
         mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5],
-        (int) status);
+        tx_status);
 }
 
 static esp_err_t ensure_wifi_started(uint8_t channel)
@@ -179,6 +182,16 @@ esp_err_t avm_espnow_new(const avm_espnow_config_t *config, avm_espnow_handle_t 
     err = esp_now_init();
     if (err != ESP_OK && err != ESP_ERR_ESPNOW_EXIST) {
         return err;
+    }
+
+    uint32_t version = 0;
+    err = esp_now_get_version(&version);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (version < 2) {
+        ESP_LOGW(TAG, "ESPNOW version %lu (need v2)", (unsigned long) version);
+        return ESP_ERR_NOT_SUPPORTED;
     }
 
     // Register callbacks (best-effort; ok if already registered).
@@ -335,5 +348,10 @@ esp_err_t avm_espnow_send(avm_espnow_handle_t *handle, const uint8_t *peer_addr_
     if (!handle || !handle->initialized || !data) {
         return ESP_ERR_INVALID_ARG;
     }
+
+    if (len > ESP_NOW_MAX_DATA_LEN_V2) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     return esp_now_send(peer_addr_or_null, data, len);
 }

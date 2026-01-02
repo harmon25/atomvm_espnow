@@ -23,24 +23,13 @@ set(ATOMVM_ESPNOW_COMPONENT_SRCS
     "nifs/espnow_driver.c"
 )
 
-# WHOLE_ARCHIVE option is supported only with esp-idf 5.x
-# A link option will be used with esp-idf 4.x
-if(IDF_VERSION_MAJOR EQUAL 5)
-    set(OPTIONAL_WHOLE_ARCHIVE WHOLE_ARCHIVE)
-else()
-    set(OPTIONAL_WHOLE_ARCHIVE "")
+if(IDF_VERSION_MAJOR LESS 5 OR (IDF_VERSION_MAJOR EQUAL 5 AND IDF_VERSION_MINOR LESS 5))
+    message(FATAL_ERROR "atomvm_espnow requires ESP-IDF >= 5.5")
 endif()
 
 idf_component_register(
     SRCS ${ATOMVM_ESPNOW_COMPONENT_SRCS}
     INCLUDE_DIRS "nifs/include"
     PRIV_REQUIRES "libatomvm" "avm_sys" "esp_wifi" "esp_netif" "esp_event" "nvs_flash"
-    ${OPTIONAL_WHOLE_ARCHIVE}
+    WHOLE_ARCHIVE
 )
-
-if (IDF_VERSION_MAJOR EQUAL 4)
-    idf_build_set_property(
-        LINK_OPTIONS "-Wl,--whole-archive ${CMAKE_CURRENT_BINARY_DIR}/lib${COMPONENT_NAME}.a -Wl,--no-whole-archive"
-        APPEND
-    )
-endif()

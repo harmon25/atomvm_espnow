@@ -15,6 +15,9 @@ Current skeleton supports:
 	- `{espnow, rx, FromMacBin, DataBin}`
 	- `{espnow, tx, broadcast | MacBin, StatusInt}`
 
+ESP-IDF requirement:
+- ESP-IDF `>= 5.5` (targets ESP-NOW v2.0 API surface)
+
 ## Quick Start
 
 ### Basic Usage (Erlang)
