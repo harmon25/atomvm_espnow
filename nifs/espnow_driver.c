@@ -1,5 +1,10 @@
 //
-// Minimal ESPNOW driver skeleton for AtomVM (ESP-IDF)
+// AtomVM ESPNOW Port Driver (ESP-IDF)
+//
+// This implements a port driver that:
+// - Owns the ESPNOW resource lifecycle
+// - Sends RX/TX events directly to the owner process (no polling)
+// - Handles commands via native mailbox handler
 //
 
 #include <stdlib.h>
@@ -17,16 +22,26 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 
+#include <context.h>
+#include <defaultatoms.h>
+#include <globalcontext.h>
+#include <interop.h>
+#include <mailbox.h>
+#include <port.h>
+#include <scheduler.h>
+#include <term.h>
+
 #include "atomvm_espnow.h"
 
-struct avm_espnow_handle {
-    bool initialized;
-    uint8_t channel;
-    QueueHandle_t rx_queue;
-    QueueHandle_t tx_queue;
-};
+static const char *TAG = "espnow_port";
 
-static const char *TAG = "atomvm_espnow";
+// Atom strings
+static const char *const espnow_atom_str = "\x6" "espnow";
+static const char *const rx_atom_str = "\x2" "rx";
+static const char *const tx_atom_str = "\x2" "tx";
+static const char *const broadcast_atom_str = "\x9" "broadcast";
+static const char *const send_atom_str = "\x4" "send";
+static const char *const add_peer_atom_str = "\x8" "add_peer";
 
 static const uint8_t broadcast_addr[ESP_NOW_ETH_ALEN] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
@@ -37,17 +52,36 @@ static inline bool is_broadcast_addr(const uint8_t *addr)
     return addr && memcmp(addr, broadcast_addr, ESP_NOW_ETH_ALEN) == 0;
 }
 
-// Current implementation supports a single active handle.
-static avm_espnow_handle_t *s_handle = NULL;
+// Global state for the singleton ESPNOW port
+static espnow_port_data_t *s_port_data = NULL;
+static GlobalContext *s_global = NULL;
+
+// Queue for events from ISR context to be processed in main loop
+typedef struct {
+    enum { EVENT_RX, EVENT_TX } type;
+    union {
+        struct {
+            uint8_t src_addr[ESP_NOW_ETH_ALEN];
+            size_t len;
+            uint8_t *data;  // heap allocated
+        } rx;
+        struct {
+            bool is_broadcast;
+            uint8_t dst_addr[ESP_NOW_ETH_ALEN];
+            int status;
+        } tx;
+    };
+} espnow_event_t;
+
+static QueueHandle_t s_event_queue = NULL;
+
+//
+// ESP-NOW Callbacks - these run in WiFi task context
+//
 
 static void recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int data_len)
 {
-    if (!recv_info || !recv_info->src_addr || !data || data_len < 0) {
-        return;
-    }
-
-    avm_espnow_handle_t *handle = s_handle;
-    if (!handle || !handle->rx_queue) {
+    if (!recv_info || !recv_info->src_addr || !data || data_len < 0 || !s_event_queue) {
         return;
     }
 
@@ -56,23 +90,30 @@ static void recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, i
         return;
     }
 
-    avm_espnow_rx_t *rx = malloc(sizeof(avm_espnow_rx_t) + (size_t) data_len);
-    if (!rx) {
+    // Allocate data copy
+    uint8_t *data_copy = malloc((size_t)data_len);
+    if (!data_copy) {
         ESP_LOGW(TAG, "RX drop: no mem");
         return;
     }
-    memcpy(rx->src_addr, recv_info->src_addr, ESP_NOW_ETH_ALEN);
-    rx->len = (size_t) data_len;
-    memcpy(rx->data, data, (size_t) data_len);
+    memcpy(data_copy, data, (size_t)data_len);
 
-    // Non-blocking enqueue; drop if full.
-    if (xQueueSend(handle->rx_queue, &rx, 0) != pdTRUE) {
+    espnow_event_t event = {
+        .type = EVENT_RX,
+        .rx = {
+            .len = (size_t)data_len,
+            .data = data_copy
+        }
+    };
+    memcpy(event.rx.src_addr, recv_info->src_addr, ESP_NOW_ETH_ALEN);
+
+    if (xQueueSend(s_event_queue, &event, 0) != pdTRUE) {
         ESP_LOGW(TAG, "RX drop: queue full");
-        free(rx);
+        free(data_copy);
         return;
     }
 
-    ESP_LOGI(TAG, "RX from %02x:%02x:%02x:%02x:%02x:%02x len=%d",
+    ESP_LOGD(TAG, "RX from %02x:%02x:%02x:%02x:%02x:%02x len=%d",
         recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
         recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5],
         data_len);
@@ -80,39 +121,39 @@ static void recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, i
 
 static void send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
 {
-    const uint8_t *mac_addr = (tx_info && tx_info->des_addr) ? tx_info->des_addr : NULL;
-    const int tx_status = tx_info ? (int) tx_info->tx_status : (int) status;
-
-    avm_espnow_handle_t *handle = s_handle;
-    if (handle && handle->tx_queue) {
-        avm_espnow_tx_t *tx = malloc(sizeof(avm_espnow_tx_t));
-        if (tx) {
-            tx->is_broadcast = is_broadcast_addr(mac_addr);
-            if (mac_addr) {
-                memcpy(tx->dst_addr, mac_addr, ESP_NOW_ETH_ALEN);
-            } else {
-                memset(tx->dst_addr, 0, ESP_NOW_ETH_ALEN);
-            }
-            tx->status = tx_status;
-
-            if (xQueueSend(handle->tx_queue, &tx, 0) != pdTRUE) {
-                free(tx);
-            }
-        }
-    }
-
-    if (is_broadcast_addr(mac_addr)) {
-        ESP_LOGI(TAG, "TX broadcast status=%d", tx_status);
+    if (!s_event_queue) {
         return;
     }
-    ESP_LOGI(TAG, "TX to %02x:%02x:%02x:%02x:%02x:%02x status=%d",
-        mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5],
-        tx_status);
+
+    const uint8_t *mac_addr = (tx_info && tx_info->des_addr) ? tx_info->des_addr : NULL;
+    const int tx_status = tx_info ? (int)tx_info->tx_status : (int)status;
+
+    espnow_event_t event = {
+        .type = EVENT_TX,
+        .tx = {
+            .is_broadcast = is_broadcast_addr(mac_addr),
+            .status = tx_status
+        }
+    };
+    if (mac_addr) {
+        memcpy(event.tx.dst_addr, mac_addr, ESP_NOW_ETH_ALEN);
+    } else {
+        memset(event.tx.dst_addr, 0, ESP_NOW_ETH_ALEN);
+    }
+
+    if (xQueueSend(s_event_queue, &event, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "TX event drop: queue full");
+    }
+
+    ESP_LOGD(TAG, "TX status=%d", tx_status);
 }
+
+//
+// WiFi/ESPNOW Initialization
+//
 
 static esp_err_t ensure_wifi_started(uint8_t channel)
 {
-    // NVS is required by WiFi/ESPNOW.
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -163,25 +204,8 @@ static esp_err_t ensure_wifi_started(uint8_t channel)
     return ESP_OK;
 }
 
-esp_err_t avm_espnow_new(const avm_espnow_config_t *config, avm_espnow_handle_t **out_handle)
+static esp_err_t espnow_init(uint8_t channel)
 {
-    if (!out_handle) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *out_handle = NULL;
-
-    if (s_handle) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    uint8_t channel = 0;
-    if (config) {
-        channel = config->channel;
-    }
-    if (channel > 14) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
     esp_err_t err = ensure_wifi_started(channel);
     if (err != ESP_OK) {
         return err;
@@ -198,11 +222,11 @@ esp_err_t avm_espnow_new(const avm_espnow_config_t *config, avm_espnow_handle_t 
         return err;
     }
     if (version < 2) {
-        ESP_LOGW(TAG, "ESPNOW version %lu (need v2)", (unsigned long) version);
+        ESP_LOGW(TAG, "ESPNOW version %lu (need v2)", (unsigned long)version);
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    // Ensure broadcast peer exists so sending to FF:FF:FF:FF:FF:FF works.
+    // Add broadcast peer
     esp_now_peer_info_t broadcast_peer = { 0 };
     memcpy(broadcast_peer.peer_addr, broadcast_addr, ESP_NOW_ETH_ALEN);
     broadcast_peer.channel = 0;
@@ -213,165 +237,304 @@ esp_err_t avm_espnow_new(const avm_espnow_config_t *config, avm_espnow_handle_t 
         return peer_err;
     }
 
-    // Register callbacks (best-effort; ok if already registered).
-    (void) esp_now_register_recv_cb(recv_cb);
-    (void) esp_now_register_send_cb(send_cb);
+    (void)esp_now_register_recv_cb(recv_cb);
+    (void)esp_now_register_send_cb(send_cb);
 
-    avm_espnow_handle_t *handle = calloc(1, sizeof(avm_espnow_handle_t));
-    if (!handle) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    handle->rx_queue = xQueueCreate(16, sizeof(void *));
-    if (!handle->rx_queue) {
-        free(handle);
-        return ESP_ERR_NO_MEM;
-    }
-
-    handle->tx_queue = xQueueCreate(16, sizeof(void *));
-    if (!handle->tx_queue) {
-        vQueueDelete(handle->rx_queue);
-        free(handle);
-        return ESP_ERR_NO_MEM;
-    }
-
-    handle->initialized = true;
-    handle->channel = channel;
-
-    s_handle = handle;
-    *out_handle = handle;
     return ESP_OK;
 }
 
-esp_err_t avm_espnow_del(avm_espnow_handle_t *handle)
+//
+// Process events from the queue and send to owner
+//
+
+static void process_espnow_events(GlobalContext *global)
 {
-    if (!handle) {
-        return ESP_ERR_INVALID_ARG;
+    if (!s_event_queue || !s_port_data || s_port_data->owner_process_id == 0) {
+        return;
     }
 
-    if (handle->rx_queue) {
-        void *ptr = NULL;
-        while (xQueueReceive(handle->rx_queue, &ptr, 0) == pdTRUE) {
-            free(ptr);
+    espnow_event_t event;
+    while (xQueueReceive(s_event_queue, &event, 0) == pdTRUE) {
+        // Allocate heap for message
+        // {espnow, rx, FromMac, Data} or {espnow, tx, To, Status}
+        size_t heap_size = 64;
+        if (event.type == EVENT_RX) {
+            heap_size += (event.rx.len + 3) / sizeof(term) + TERM_BINARY_HEAP_SIZE(event.rx.len) + TERM_BINARY_HEAP_SIZE(ESP_NOW_ETH_ALEN);
+        } else {
+            heap_size += TERM_BINARY_HEAP_SIZE(ESP_NOW_ETH_ALEN);
         }
-        vQueueDelete(handle->rx_queue);
-        handle->rx_queue = NULL;
-    }
 
-    if (handle->tx_queue) {
-        void *ptr = NULL;
-        while (xQueueReceive(handle->tx_queue, &ptr, 0) == pdTRUE) {
-            free(ptr);
+        Heap heap;
+        if (UNLIKELY(memory_init_heap(&heap, heap_size) != MEMORY_GC_OK)) {
+            if (event.type == EVENT_RX) {
+                free(event.rx.data);
+            }
+            continue;
         }
-        vQueueDelete(handle->tx_queue);
-        handle->tx_queue = NULL;
-    }
 
-    if (s_handle == handle) {
-        s_handle = NULL;
-    }
+        term msg;
+        if (event.type == EVENT_RX) {
+            // {espnow, rx, FromMac, Data}
+            term espnow_atom = globalcontext_make_atom(global, espnow_atom_str);
+            term rx_atom = globalcontext_make_atom(global, rx_atom_str);
+            term from_bin = term_from_literal_binary(event.rx.src_addr, ESP_NOW_ETH_ALEN, &heap, global);
+            term data_bin = term_from_literal_binary(event.rx.data, event.rx.len, &heap, global);
+            free(event.rx.data);
 
-    // Best-effort deinit; a future implementation may refcount or centralize init.
-    (void) esp_now_deinit();
+            msg = term_alloc_tuple(4, &heap);
+            term_put_tuple_element(msg, 0, espnow_atom);
+            term_put_tuple_element(msg, 1, rx_atom);
+            term_put_tuple_element(msg, 2, from_bin);
+            term_put_tuple_element(msg, 3, data_bin);
+        } else {
+            // {espnow, tx, To, Status}
+            term espnow_atom = globalcontext_make_atom(global, espnow_atom_str);
+            term tx_atom = globalcontext_make_atom(global, tx_atom_str);
+            term to_term;
+            if (event.tx.is_broadcast) {
+                to_term = globalcontext_make_atom(global, broadcast_atom_str);
+            } else {
+                to_term = term_from_literal_binary(event.tx.dst_addr, ESP_NOW_ETH_ALEN, &heap, global);
+            }
+            term status_term = term_from_int(event.tx.status);
 
-    free(handle);
-    return ESP_OK;
-}
-
-esp_err_t avm_espnow_recv(avm_espnow_handle_t *handle, avm_espnow_rx_t **out_rx)
-{
-    if (!out_rx) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *out_rx = NULL;
-
-    if (!handle || !handle->initialized || !handle->rx_queue) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    void *ptr = NULL;
-    if (xQueueReceive(handle->rx_queue, &ptr, 0) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-
-    *out_rx = (avm_espnow_rx_t *) ptr;
-    return ESP_OK;
-}
-
-void avm_espnow_rx_free(avm_espnow_rx_t *rx)
-{
-    free(rx);
-}
-
-esp_err_t avm_espnow_poll(avm_espnow_handle_t *handle, avm_espnow_rx_t **out_rx, avm_espnow_tx_t **out_tx)
-{
-    if (!out_rx || !out_tx) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *out_rx = NULL;
-    *out_tx = NULL;
-
-    if (!handle || !handle->initialized) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    // Prefer RX over TX.
-    if (handle->rx_queue) {
-        void *ptr = NULL;
-        if (xQueueReceive(handle->rx_queue, &ptr, 0) == pdTRUE) {
-            *out_rx = (avm_espnow_rx_t *) ptr;
-            return ESP_OK;
+            msg = term_alloc_tuple(4, &heap);
+            term_put_tuple_element(msg, 0, espnow_atom);
+            term_put_tuple_element(msg, 1, tx_atom);
+            term_put_tuple_element(msg, 2, to_term);
+            term_put_tuple_element(msg, 3, status_term);
         }
-    }
 
-    if (handle->tx_queue) {
-        void *ptr = NULL;
-        if (xQueueReceive(handle->tx_queue, &ptr, 0) == pdTRUE) {
-            *out_tx = (avm_espnow_tx_t *) ptr;
-            return ESP_OK;
+        globalcontext_send_message(global, s_port_data->owner_process_id, msg);
+        memory_destroy_heap(&heap, global);
+    }
+}
+
+//
+// Port Native Handler - processes commands from Erlang
+//
+
+static NativeHandlerResult espnow_consume_mailbox(Context *ctx)
+{
+    Message *msg = mailbox_first(&ctx->mailbox);
+    term message = msg->message;
+
+    espnow_port_data_t *data = (espnow_port_data_t *)ctx->platform_data;
+
+    // First, check for any pending ESPNOW events
+    process_espnow_events(ctx->global);
+
+    GenMessage gen_message;
+    GenMessageParseResult result = port_parse_gen_message(message, &gen_message);
+
+    if (result == GenCallMessage) {
+        // Handle gen_server:call style messages
+        term cmd = gen_message.req;
+
+        if (term_is_tuple(cmd) && term_get_tuple_arity(cmd) >= 1) {
+            term cmd_name = term_get_tuple_element(cmd, 0);
+
+            // {send, To, Data}
+            if (globalcontext_is_term_equal_to_atom_string(ctx->global, cmd_name, send_atom_str)) {
+                if (term_get_tuple_arity(cmd) >= 3) {
+                    term to_term = term_get_tuple_element(cmd, 1);
+                    term data_term = term_get_tuple_element(cmd, 2);
+
+                    if (!term_is_binary(data_term)) {
+                        port_send_reply(ctx, gen_message.pid, gen_message.ref, 
+                            port_create_error_tuple(ctx, BADARG_ATOM));
+                        goto done;
+                    }
+
+                    const uint8_t *peer_addr = NULL;
+                    if (term_is_atom(to_term)) {
+                        if (globalcontext_is_term_equal_to_atom_string(ctx->global, to_term, broadcast_atom_str)) {
+                            peer_addr = NULL;  // broadcast
+                        } else {
+                            port_send_reply(ctx, gen_message.pid, gen_message.ref,
+                                port_create_error_tuple(ctx, BADARG_ATOM));
+                            goto done;
+                        }
+                    } else if (term_is_binary(to_term) && term_binary_size(to_term) == ESP_NOW_ETH_ALEN) {
+                        peer_addr = (const uint8_t *)term_binary_data(to_term);
+                    } else {
+                        port_send_reply(ctx, gen_message.pid, gen_message.ref,
+                            port_create_error_tuple(ctx, BADARG_ATOM));
+                        goto done;
+                    }
+
+                    const uint8_t *send_data = (const uint8_t *)term_binary_data(data_term);
+                    size_t send_len = term_binary_size(data_term);
+                    const uint8_t *dst = peer_addr ? peer_addr : broadcast_addr;
+
+                    esp_err_t err = esp_now_send(dst, send_data, send_len);
+                    if (err != ESP_OK) {
+                        port_send_reply(ctx, gen_message.pid, gen_message.ref,
+                            port_create_error_tuple(ctx, term_from_int(err)));
+                    } else {
+                        port_send_reply(ctx, gen_message.pid, gen_message.ref, OK_ATOM);
+                    }
+                    goto done;
+                }
+            }
+
+            // {add_peer, Mac, Channel}
+            if (globalcontext_is_term_equal_to_atom_string(ctx->global, cmd_name, add_peer_atom_str)) {
+                if (term_get_tuple_arity(cmd) >= 3) {
+                    term mac_term = term_get_tuple_element(cmd, 1);
+                    term channel_term = term_get_tuple_element(cmd, 2);
+
+                    if (!term_is_binary(mac_term) || term_binary_size(mac_term) != ESP_NOW_ETH_ALEN) {
+                        port_send_reply(ctx, gen_message.pid, gen_message.ref,
+                            port_create_error_tuple(ctx, BADARG_ATOM));
+                        goto done;
+                    }
+
+                    if (!term_is_integer(channel_term)) {
+                        port_send_reply(ctx, gen_message.pid, gen_message.ref,
+                            port_create_error_tuple(ctx, BADARG_ATOM));
+                        goto done;
+                    }
+
+                    const uint8_t *peer_addr = (const uint8_t *)term_binary_data(mac_term);
+                    uint8_t channel = (uint8_t)term_to_int(channel_term);
+
+                    esp_now_peer_info_t peer = { 0 };
+                    memcpy(peer.peer_addr, peer_addr, ESP_NOW_ETH_ALEN);
+                    peer.channel = channel;
+                    peer.ifidx = WIFI_IF_STA;
+                    peer.encrypt = false;
+
+                    esp_err_t err = esp_now_add_peer(&peer);
+                    if (err == ESP_ERR_ESPNOW_EXIST) {
+                        err = ESP_OK;
+                    }
+
+                    if (err != ESP_OK) {
+                        port_send_reply(ctx, gen_message.pid, gen_message.ref,
+                            port_create_error_tuple(ctx, term_from_int(err)));
+                    } else {
+                        port_send_reply(ctx, gen_message.pid, gen_message.ref, OK_ATOM);
+                    }
+                    goto done;
+                }
+            }
         }
+
+        // Unknown command
+        port_send_reply(ctx, gen_message.pid, gen_message.ref,
+            port_create_error_tuple(ctx, BADARG_ATOM));
     }
 
-    return ESP_ERR_TIMEOUT;
+done:
+    mailbox_remove_message(&ctx->mailbox, &ctx->heap);
+    
+    // Process any events that came in while handling the command
+    process_espnow_events(ctx->global);
+    
+    return NativeContinue;
 }
 
-void avm_espnow_tx_free(avm_espnow_tx_t *tx)
+//
+// Port Driver Interface
+//
+
+Context *atomvm_espnow_create_port(GlobalContext *global, term opts)
 {
-    free(tx);
+    if (s_port_data != NULL) {
+        ESP_LOGE(TAG, "ESPNOW port already exists (singleton)");
+        return NULL;
+    }
+
+    // Parse options: [{channel, N}, {owner, Pid}]
+    uint8_t channel = 0;
+    int32_t owner_pid = 0;
+
+    term channel_term = interop_kv_get_value_default(opts, ATOM_STR("\x7", "channel"), term_from_int(0), global);
+    if (term_is_integer(channel_term)) {
+        channel = (uint8_t)term_to_int(channel_term);
+    }
+
+    term owner_term = interop_kv_get_value(opts, ATOM_STR("\x5", "owner"), global);
+    if (term_is_pid(owner_term)) {
+        owner_pid = term_to_local_process_id(owner_term);
+    }
+
+    // Initialize ESPNOW
+    esp_err_t err = espnow_init(channel);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "espnow_init failed: %d", (int)err);
+        return NULL;
+    }
+
+    // Create event queue
+    s_event_queue = xQueueCreate(32, sizeof(espnow_event_t));
+    if (!s_event_queue) {
+        ESP_LOGE(TAG, "Failed to create event queue");
+        return NULL;
+    }
+
+    // Create port context
+    Context *ctx = context_new(global);
+    if (!ctx) {
+        vQueueDelete(s_event_queue);
+        s_event_queue = NULL;
+        return NULL;
+    }
+
+    // Allocate port data
+    espnow_port_data_t *port_data = calloc(1, sizeof(espnow_port_data_t));
+    if (!port_data) {
+        context_destroy(ctx);
+        vQueueDelete(s_event_queue);
+        s_event_queue = NULL;
+        return NULL;
+    }
+
+    port_data->initialized = true;
+    port_data->channel = channel;
+    port_data->owner_process_id = owner_pid;
+    port_data->global = global;
+
+    ctx->native_handler = espnow_consume_mailbox;
+    ctx->platform_data = port_data;
+
+    s_port_data = port_data;
+    s_global = global;
+
+    ESP_LOGI(TAG, "ESPNOW port created (channel=%d, owner=%d)", (int)channel, (int)owner_pid);
+
+    return ctx;
 }
 
-esp_err_t avm_espnow_add_peer(avm_espnow_handle_t *handle, const uint8_t peer_addr[ESP_NOW_ETH_ALEN], uint8_t channel)
+void atomvm_espnow_init(GlobalContext *global)
 {
-    if (!handle || !handle->initialized || !peer_addr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (channel > 14) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    esp_now_peer_info_t peer = { 0 };
-    memcpy(peer.peer_addr, peer_addr, ESP_NOW_ETH_ALEN);
-    peer.channel = channel; // 0 means current channel
-    peer.ifidx = WIFI_IF_STA;
-    peer.encrypt = false;
-
-    esp_err_t err = esp_now_add_peer(&peer);
-    if (err == ESP_ERR_ESPNOW_EXIST) {
-        return ESP_OK;
-    }
-    return err;
+    UNUSED(global);
+    ESP_LOGI(TAG, "ESPNOW port driver registered");
 }
 
-esp_err_t avm_espnow_send(avm_espnow_handle_t *handle, const uint8_t *peer_addr_or_null, const uint8_t *data, size_t len)
+void atomvm_espnow_destroy(GlobalContext *global)
 {
-    if (!handle || !handle->initialized || !data) {
-        return ESP_ERR_INVALID_ARG;
+    UNUSED(global);
+    
+    if (s_event_queue) {
+        espnow_event_t event;
+        while (xQueueReceive(s_event_queue, &event, 0) == pdTRUE) {
+            if (event.type == EVENT_RX && event.rx.data) {
+                free(event.rx.data);
+            }
+        }
+        vQueueDelete(s_event_queue);
+        s_event_queue = NULL;
     }
 
-    if (len > ESP_NOW_MAX_DATA_LEN_V2) {
-        return ESP_ERR_INVALID_ARG;
+    if (s_port_data) {
+        free(s_port_data);
+        s_port_data = NULL;
     }
 
-    const uint8_t *dst = peer_addr_or_null ? peer_addr_or_null : broadcast_addr;
-    return esp_now_send(dst, data, len);
+    s_global = NULL;
+
+    esp_now_deinit();
+    ESP_LOGI(TAG, "ESPNOW port driver destroyed");
 }

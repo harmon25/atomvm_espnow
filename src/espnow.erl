@@ -1,116 +1,77 @@
 %%
-%% AtomVM ESPNOW Erlang wrapper (WIP skeleton)
+%% AtomVM ESPNOW Port Driver Wrapper
+%%
+%% Usage:
+%%   {ok, Port} = espnow:open([{channel, 1}]).
+%%   ok = espnow:send(Port, broadcast, <<"hello">>).
+%%   ok = espnow:add_peer(Port, <<MAC:6/binary>>, 0).
+%%
+%% Messages received by the calling process:
+%%   {espnow, rx, FromMacBin, DataBin}
+%%   {espnow, tx, broadcast | MacBin, StatusInt}
 %%
 
 -module(espnow).
 
 -export([
-    init/0, init/1, deinit/1,
-    add_peer/3, send/3,
-    recv/1, poll/1,
-    active/1, active/2, active_stop/1
+    open/0, open/1,
+    close/1,
+    send/3,
+    add_peer/3
 ]).
 
-%% NIF entrypoints (resolved by AtomVM)
--export([nif_init/1, nif_deinit/1, nif_add_peer/3, nif_send/3, nif_recv/1, nif_poll/1]).
+%% @doc Open the ESPNOW port with default options (channel 0, owner = self()).
+-spec open() -> {ok, port()} | {error, term()}.
+open() ->
+    open([]).
 
--define(NIF_STUB, erlang:nif_error(nif_not_loaded)).
-
-%% Public API
-
-init() ->
-    init(0).
-
-%% @doc Initialize ESPNOW. Channel 0 means "leave unchanged".
-init(Channel) when is_integer(Channel) ->
-    %% Note: current implementation is singleton; returns {error, busy} if already initialized.
-    nif_init(Channel).
-
-deinit(Handle) when is_binary(Handle) ->
-    nif_deinit(Handle).
-
-%% @doc Add a peer. PeerMac is a 6-byte binary; Channel 0 means "current".
-add_peer(Handle, PeerMac, Channel)
-        when is_binary(Handle), is_binary(PeerMac), is_integer(Channel) ->
-    nif_add_peer(Handle, PeerMac, Channel).
-
-%% @doc Send data to a peer or broadcast.
-%% To = broadcast | <<Mac:6/binary>>
-send(Handle, To, Data)
-        when is_binary(Handle), (To =:= broadcast orelse is_binary(To)), is_binary(Data) ->
-    nif_send(Handle, To, Data).
-
-%% @doc Non-blocking receive: returns {ok, FromMacBin, DataBin} | none.
-recv(Handle) when is_binary(Handle) ->
-    nif_recv(Handle).
-
-%% @doc Non-blocking poll: returns one of:
-%% - none
-%% - {rx, FromMacBin, DataBin}
-%% - {tx, broadcast | <<Mac:6/binary>>, StatusInt}
-poll(Handle) when is_binary(Handle) ->
-    nif_poll(Handle).
-
-%% @doc Start active mode for the calling process.
-%% Returns the spawned poller pid.
-active(Handle) ->
-    active(Handle, self()).
-
-%% @doc Start active mode and forward messages to OwnerPid.
-%% Messages have the shape:
-%% - {espnow, rx, FromMacBin, DataBin}
-%% - {espnow, tx, broadcast | <<Mac:6/binary>>, StatusInt}
-active(Handle, OwnerPid) when is_binary(Handle), is_pid(OwnerPid) ->
-    spawn(fun() -> active_loop(Handle, OwnerPid) end).
-
-active_loop(Handle, OwnerPid) ->
-    Ref = erlang:monitor(process, OwnerPid),
-    active_loop(Handle, OwnerPid, Ref).
-
-active_loop(Handle, OwnerPid, Ref) ->
-    receive
-        stop ->
-            erlang:demonitor(Ref, [flush]),
-            ok;
-        {'DOWN', Ref, process, OwnerPid, _Reason} ->
-            %% Best-effort cleanup when owner is gone.
-            _ = catch deinit(Handle),
-            ok
-    after 0 ->
-        %% Drain all available events without sleeping.
-        case poll(Handle) of
-            none ->
-                timer:sleep(10),
-                active_loop(Handle, OwnerPid, Ref);
-            {rx, From, Data} ->
-                OwnerPid ! {espnow, rx, From, Data},
-                active_loop(Handle, OwnerPid, Ref);
-            {tx, To, Status} ->
-                OwnerPid ! {espnow, tx, To, Status},
-                active_loop(Handle, OwnerPid, Ref);
-            {error, _} = Err ->
-                OwnerPid ! {espnow, error, Err},
-                timer:sleep(100),
-                active_loop(Handle, OwnerPid, Ref)
-        end
+%% @doc Open the ESPNOW port.
+%% Options:
+%%   {channel, 0..14} - WiFi channel (0 = don't change)
+%%   {owner, pid()}   - Process to receive RX/TX messages (default: self())
+-spec open(proplists:proplist()) -> {ok, port()} | {error, term()}.
+open(Options) when is_list(Options) ->
+    Owner = proplists:get_value(owner, Options, self()),
+    Channel = proplists:get_value(channel, Options, 0),
+    PortOptions = [{channel, Channel}, {owner, Owner}],
+    try
+        Port = open_port({spawn, "espnow"}, PortOptions),
+        {ok, Port}
+    catch
+        error:badarg ->
+            {error, already_started};
+        Class:Reason ->
+            {error, {Class, Reason}}
     end.
 
-%% @doc Stop an active-mode poller started by active/1,2.
-active_stop(PollerPid) when is_pid(PollerPid) ->
-    PollerPid ! stop,
+%% @doc Close the ESPNOW port.
+-spec close(port()) -> ok.
+close(Port) when is_port(Port) ->
+    port_close(Port),
     ok.
 
-%% NIF stubs
+%% @doc Send data via ESPNOW.
+%% To = broadcast | <<Mac:6/binary>>
+-spec send(port(), broadcast | binary(), binary()) -> ok | {error, term()}.
+send(Port, To, Data) when is_port(Port), is_binary(Data) ->
+    case To of
+        broadcast -> ok;
+        B when is_binary(B), byte_size(B) =:= 6 -> ok;
+        _ -> error(badarg)
+    end,
+    gen_server_call(Port, {send, To, Data}).
 
-nif_init(_Channel) -> ?NIF_STUB.
+%% @doc Add a peer for unicast communication.
+-spec add_peer(port(), binary(), non_neg_integer()) -> ok | {error, term()}.
+add_peer(Port, Mac, Channel) when is_port(Port), is_binary(Mac), byte_size(Mac) =:= 6, is_integer(Channel) ->
+    gen_server_call(Port, {add_peer, Mac, Channel}).
 
-nif_deinit(_Handle) -> ?NIF_STUB.
-
-nif_add_peer(_Handle, _PeerMac, _Channel) -> ?NIF_STUB.
-
-nif_send(_Handle, _To, _Data) -> ?NIF_STUB.
-
-nif_recv(_Handle) -> ?NIF_STUB.
-
-nif_poll(_Handle) -> ?NIF_STUB.
-
+%% Internal: Simple gen_server:call style implementation for ports
+gen_server_call(Port, Request) ->
+    Ref = make_ref(),
+    Port ! {'$gen_call', {self(), Ref}, Request},
+    receive
+        {Ref, Reply} -> Reply
+    after 5000 ->
+        {error, timeout}
+    end.
