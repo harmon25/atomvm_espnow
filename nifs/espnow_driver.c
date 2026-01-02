@@ -159,6 +159,10 @@ esp_err_t avm_espnow_new(const avm_espnow_config_t *config, avm_espnow_handle_t 
     }
     *out_handle = NULL;
 
+    if (s_handle) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     uint8_t channel = 0;
     if (config) {
         channel = config->channel;

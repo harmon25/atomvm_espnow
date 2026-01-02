@@ -15,6 +15,7 @@
 
 static const char *const not_supported_atom = "\xD" "not_supported";
 static const char *const broadcast_atom = "\x9" "broadcast";
+static const char *const busy_atom = "\x4" "busy";
 static const char *const none_atom = "\x4" "none";
 static const char *const rx_atom = "\x2" "rx";
 static const char *const tx_atom = "\x2" "tx";
@@ -63,6 +64,9 @@ static term nif_init(Context *ctx, int argc, term argv[])
     avm_espnow_handle_t *handle = NULL;
     esp_err_t err = avm_espnow_new(&config, &handle);
     if (err != ESP_OK) {
+        if (err == ESP_ERR_INVALID_STATE) {
+            return make_error_tuple(ctx, globalcontext_make_atom(ctx->global, busy_atom));
+        }
         return make_error_tuple(ctx, term_from_int(err));
     }
 

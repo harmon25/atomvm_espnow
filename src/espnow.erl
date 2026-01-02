@@ -23,6 +23,7 @@ init() ->
 
 %% @doc Initialize ESPNOW. Channel 0 means "leave unchanged".
 init(Channel) when is_integer(Channel) ->
+    %% Note: current implementation is singleton; returns {error, busy} if already initialized.
     nif_init(Channel).
 
 deinit(Handle) when is_binary(Handle) ->
@@ -56,7 +57,9 @@ active(Handle) ->
     active(Handle, self()).
 
 %% @doc Start active mode and forward messages to OwnerPid.
-%% Messages have the shape: {espnow, FromMacBin, DataBin}
+%% Messages have the shape:
+%% - {espnow, rx, FromMacBin, DataBin}
+%% - {espnow, tx, broadcast | <<Mac:6/binary>>, StatusInt}
 active(Handle, OwnerPid) when is_binary(Handle), is_pid(OwnerPid) ->
     spawn(fun() -> active_loop(Handle, OwnerPid) end).
 

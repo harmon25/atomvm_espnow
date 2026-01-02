@@ -10,6 +10,7 @@ Current skeleton supports:
 - `espnow:init/1` / `espnow:deinit/1`
 - `espnow:add_peer/3`
 - `espnow:send/3`
+- Singleton driver model: only one active handle at a time (`espnow:init/1` returns `{error, busy}` if already initialized)
 - Active mode via `espnow:active/1,2` which forwards async messages to an owner pid:
 	- `{espnow, rx, FromMacBin, DataBin}`
 	- `{espnow, tx, broadcast | MacBin, StatusInt}`
