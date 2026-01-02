@@ -23,7 +23,7 @@ defmodule ESPNowExample do
     {:ok, port} = :espnow.open([{:channel, channel}])
     IO.puts("ESPNOW port opened on channel #{channel}")
 
-    node_id = node_id32()
+    node_id = node_id()
     IO.puts("Node ID: #{node_id}")
 
     # Kick off discovery immediately
@@ -35,7 +35,7 @@ defmodule ESPNowExample do
   defp loop(port, node_id, peers) do
     receive do
       :discover_tick ->
-        nonce = nonce32()
+        nonce = nonce()
 
         case :espnow.send(port, :broadcast, encode_discover_req(nonce, node_id)) do
           :ok ->
@@ -119,13 +119,13 @@ defmodule ESPNowExample do
 
   defp decode_discovery(_), do: :ignore
 
-  defp node_id32() do
-    # 16-bit node ID (0-65535) - saves memory vs 32-bit
+  defp node_id() do
+    # 16-bit node ID (0-65535)
     :atomvm.random() &&& 0xFFFF
   end
 
-  defp nonce32() do
-    # 16-bit nonce - sufficient for collision avoidance
+  defp nonce() do
+    # 16-bit nonce
     :atomvm.random() &&& 0xFFFF
   end
 

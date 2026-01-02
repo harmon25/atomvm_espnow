@@ -34,7 +34,7 @@ start() ->
     Channel = 1,
     {ok, Port} = espnow:open([{channel, Channel}]),
 
-    NodeId = node_id16(),
+    NodeId = node_id(),
     io:format("espnow_example: started (node_id=~p channel=~p)~n", [NodeId, Channel]),
 
     %% Kick off discovery immediately, then repeat.
@@ -44,7 +44,7 @@ start() ->
 loop(Port, NodeId, Peers) ->
     receive
         discover_tick ->
-            Nonce = nonce16(),
+            Nonce = nonce(),
             ok = espnow:send(Port, broadcast, encode_discover_req(Nonce, NodeId)),
             erlang:send_after(3000, self(), discover_tick),
             loop(Port, NodeId, Peers);
@@ -106,10 +106,10 @@ decode_discovery(<<?DISCOVER_RESP:8, Nonce:16/unsigned-little, PeerId:16/unsigne
 decode_discovery(_) ->
     ignore.
 
-node_id16() ->
+node_id() ->
     atomvm:random() band 16#FFFF.
 
-nonce16() ->
+nonce() ->
     atomvm:random() band 16#FFFF.
 
 mac_to_string(<<A:8, B:8, C:8, D:8, E:8, F:8>>) ->
