@@ -42,6 +42,9 @@ static const char *const tx_atom_str = "\x2" "tx";
 static const char *const broadcast_atom_str = "\x9" "broadcast";
 static const char *const send_atom_str = "\x4" "send";
 static const char *const add_peer_atom_str = "\x8" "add_peer";
+static const char *const mod_peer_atom_str = "\x8" "mod_peer";
+static const char *const del_peer_atom_str = "\x8" "del_peer";
+static const char *const peer_exists_atom_str = "\xB" "peer_exists";
 
 static const uint8_t broadcast_addr[ESP_NOW_ETH_ALEN] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
@@ -314,117 +317,236 @@ static void process_espnow_events(GlobalContext *global)
 // Port Native Handler - processes commands from Erlang
 //
 
+// Atom string for $gen_call
+static const char *const gen_call_atom_str = "\x9" "$gen_call";
+
+// Helper to send reply {Ref, Reply} to pid
+static void send_call_reply(Context *ctx, term pid, term ref, term reply)
+{
+    // Allocate tuple {Ref, Reply}
+    if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+        return;
+    }
+    term reply_tuple = term_alloc_tuple(2, &ctx->heap);
+    term_put_tuple_element(reply_tuple, 0, ref);
+    term_put_tuple_element(reply_tuple, 1, reply);
+
+    int32_t pid_id = term_to_local_process_id(pid);
+    globalcontext_send_message(ctx->global, pid_id, reply_tuple);
+}
+
 static NativeHandlerResult espnow_consume_mailbox(Context *ctx)
 {
     Message *msg = mailbox_first(&ctx->mailbox);
     term message = msg->message;
 
-    espnow_port_data_t *data = (espnow_port_data_t *)ctx->platform_data;
+    UNUSED(ctx->platform_data);
 
     // First, check for any pending ESPNOW events
     process_espnow_events(ctx->global);
 
-    GenMessage gen_message;
-    GenMessageParseResult result = port_parse_gen_message(message, &gen_message);
+    // Manually parse {'$gen_call', {Pid, Ref}, Request}
+    term pid = term_invalid_term();
+    term ref = term_invalid_term();
+    term cmd = term_invalid_term();
 
-    if (result == GenCallMessage) {
-        // Handle gen_server:call style messages
-        term cmd = gen_message.req;
-
-        if (term_is_tuple(cmd) && term_get_tuple_arity(cmd) >= 1) {
-            term cmd_name = term_get_tuple_element(cmd, 0);
-
-            // {send, To, Data}
-            if (globalcontext_is_term_equal_to_atom_string(ctx->global, cmd_name, send_atom_str)) {
-                if (term_get_tuple_arity(cmd) >= 3) {
-                    term to_term = term_get_tuple_element(cmd, 1);
-                    term data_term = term_get_tuple_element(cmd, 2);
-
-                    if (!term_is_binary(data_term)) {
-                        port_send_reply(ctx, gen_message.pid, gen_message.ref, 
-                            port_create_error_tuple(ctx, BADARG_ATOM));
-                        goto done;
-                    }
-
-                    const uint8_t *peer_addr = NULL;
-                    if (term_is_atom(to_term)) {
-                        if (globalcontext_is_term_equal_to_atom_string(ctx->global, to_term, broadcast_atom_str)) {
-                            peer_addr = NULL;  // broadcast
-                        } else {
-                            port_send_reply(ctx, gen_message.pid, gen_message.ref,
-                                port_create_error_tuple(ctx, BADARG_ATOM));
-                            goto done;
-                        }
-                    } else if (term_is_binary(to_term) && term_binary_size(to_term) == ESP_NOW_ETH_ALEN) {
-                        peer_addr = (const uint8_t *)term_binary_data(to_term);
-                    } else {
-                        port_send_reply(ctx, gen_message.pid, gen_message.ref,
-                            port_create_error_tuple(ctx, BADARG_ATOM));
-                        goto done;
-                    }
-
-                    const uint8_t *send_data = (const uint8_t *)term_binary_data(data_term);
-                    size_t send_len = term_binary_size(data_term);
-                    const uint8_t *dst = peer_addr ? peer_addr : broadcast_addr;
-
-                    esp_err_t err = esp_now_send(dst, send_data, send_len);
-                    if (err != ESP_OK) {
-                        port_send_reply(ctx, gen_message.pid, gen_message.ref,
-                            port_create_error_tuple(ctx, term_from_int(err)));
-                    } else {
-                        port_send_reply(ctx, gen_message.pid, gen_message.ref, OK_ATOM);
-                    }
-                    goto done;
-                }
+    if (term_is_tuple(message) && term_get_tuple_arity(message) == 3) {
+        term tag = term_get_tuple_element(message, 0);
+        if (term_is_atom(tag) && globalcontext_is_term_equal_to_atom_string(ctx->global, tag, gen_call_atom_str)) {
+            term from = term_get_tuple_element(message, 1);
+            if (term_is_tuple(from) && term_get_tuple_arity(from) == 2) {
+                pid = term_get_tuple_element(from, 0);
+                ref = term_get_tuple_element(from, 1);
+                cmd = term_get_tuple_element(message, 2);
             }
+        }
+    }
 
-            // {add_peer, Mac, Channel}
-            if (globalcontext_is_term_equal_to_atom_string(ctx->global, cmd_name, add_peer_atom_str)) {
-                if (term_get_tuple_arity(cmd) >= 3) {
-                    term mac_term = term_get_tuple_element(cmd, 1);
-                    term channel_term = term_get_tuple_element(cmd, 2);
+    if (term_is_invalid_term(cmd)) {
+        ESP_LOGW(TAG, "Unknown message format, ignoring");
+        goto done;
+    }
 
-                    if (!term_is_binary(mac_term) || term_binary_size(mac_term) != ESP_NOW_ETH_ALEN) {
-                        port_send_reply(ctx, gen_message.pid, gen_message.ref,
-                            port_create_error_tuple(ctx, BADARG_ATOM));
-                        goto done;
-                    }
+    // Handle commands
+    if (term_is_tuple(cmd) && term_get_tuple_arity(cmd) >= 1) {
+        term cmd_name = term_get_tuple_element(cmd, 0);
 
-                    if (!term_is_integer(channel_term)) {
-                        port_send_reply(ctx, gen_message.pid, gen_message.ref,
-                            port_create_error_tuple(ctx, BADARG_ATOM));
-                        goto done;
-                    }
+        // {send, To, Data}
+        if (globalcontext_is_term_equal_to_atom_string(ctx->global, cmd_name, send_atom_str)) {
+            if (term_get_tuple_arity(cmd) >= 3) {
+                term to_term = term_get_tuple_element(cmd, 1);
+                term data_term = term_get_tuple_element(cmd, 2);
 
-                    const uint8_t *peer_addr = (const uint8_t *)term_binary_data(mac_term);
-                    uint8_t channel = (uint8_t)term_to_int(channel_term);
-
-                    esp_now_peer_info_t peer = { 0 };
-                    memcpy(peer.peer_addr, peer_addr, ESP_NOW_ETH_ALEN);
-                    peer.channel = channel;
-                    peer.ifidx = WIFI_IF_STA;
-                    peer.encrypt = false;
-
-                    esp_err_t err = esp_now_add_peer(&peer);
-                    if (err == ESP_ERR_ESPNOW_EXIST) {
-                        err = ESP_OK;
-                    }
-
-                    if (err != ESP_OK) {
-                        port_send_reply(ctx, gen_message.pid, gen_message.ref,
-                            port_create_error_tuple(ctx, term_from_int(err)));
-                    } else {
-                        port_send_reply(ctx, gen_message.pid, gen_message.ref, OK_ATOM);
-                    }
+                if (!term_is_binary(data_term)) {
+                    send_call_reply(ctx, pid, ref, 
+                        port_create_error_tuple(ctx, BADARG_ATOM));
                     goto done;
                 }
+
+                const uint8_t *peer_addr = NULL;
+                if (term_is_atom(to_term)) {
+                    if (globalcontext_is_term_equal_to_atom_string(ctx->global, to_term, broadcast_atom_str)) {
+                        peer_addr = NULL;  // broadcast
+                    } else {
+                        send_call_reply(ctx, pid, ref,
+                            port_create_error_tuple(ctx, BADARG_ATOM));
+                        goto done;
+                    }
+                } else if (term_is_binary(to_term) && term_binary_size(to_term) == ESP_NOW_ETH_ALEN) {
+                    peer_addr = (const uint8_t *)term_binary_data(to_term);
+                } else {
+                    send_call_reply(ctx, pid, ref,
+                        port_create_error_tuple(ctx, BADARG_ATOM));
+                    goto done;
+                }
+
+                const uint8_t *send_data = (const uint8_t *)term_binary_data(data_term);
+                size_t send_len = term_binary_size(data_term);
+                const uint8_t *dst = peer_addr ? peer_addr : broadcast_addr;
+
+                esp_err_t err = esp_now_send(dst, send_data, send_len);
+                if (err != ESP_OK) {
+                    send_call_reply(ctx, pid, ref,
+                        port_create_error_tuple(ctx, term_from_int(err)));
+                } else {
+                    send_call_reply(ctx, pid, ref, OK_ATOM);
+                }
+                goto done;
             }
         }
 
-        // Unknown command
-        port_send_reply(ctx, gen_message.pid, gen_message.ref,
-            port_create_error_tuple(ctx, BADARG_ATOM));
+        // {add_peer, Mac, Channel}
+        if (globalcontext_is_term_equal_to_atom_string(ctx->global, cmd_name, add_peer_atom_str)) {
+            if (term_get_tuple_arity(cmd) >= 3) {
+                term mac_term = term_get_tuple_element(cmd, 1);
+                term channel_term = term_get_tuple_element(cmd, 2);
+
+                if (!term_is_binary(mac_term) || term_binary_size(mac_term) != ESP_NOW_ETH_ALEN) {
+                    send_call_reply(ctx, pid, ref,
+                        port_create_error_tuple(ctx, BADARG_ATOM));
+                    goto done;
+                }
+
+                if (!term_is_integer(channel_term)) {
+                    send_call_reply(ctx, pid, ref,
+                        port_create_error_tuple(ctx, BADARG_ATOM));
+                    goto done;
+                }
+
+                const uint8_t *peer_addr = (const uint8_t *)term_binary_data(mac_term);
+                uint8_t channel = (uint8_t)term_to_int(channel_term);
+
+                // Check if peer already exists to avoid ESP-IDF warning
+                if (esp_now_is_peer_exist(peer_addr)) {
+                    send_call_reply(ctx, pid, ref, OK_ATOM);
+                    goto done;
+                }
+
+                esp_now_peer_info_t peer = { 0 };
+                memcpy(peer.peer_addr, peer_addr, ESP_NOW_ETH_ALEN);
+                peer.channel = channel;
+                peer.ifidx = WIFI_IF_STA;
+                peer.encrypt = false;
+
+                esp_err_t err = esp_now_add_peer(&peer);
+
+                if (err != ESP_OK) {
+                    send_call_reply(ctx, pid, ref,
+                        port_create_error_tuple(ctx, term_from_int(err)));
+                } else {
+                    send_call_reply(ctx, pid, ref, OK_ATOM);
+                }
+                goto done;
+            }
+        }
+
+        // {mod_peer, Mac, Channel} - modify existing peer
+        if (globalcontext_is_term_equal_to_atom_string(ctx->global, cmd_name, mod_peer_atom_str)) {
+            if (term_get_tuple_arity(cmd) >= 3) {
+                term mac_term = term_get_tuple_element(cmd, 1);
+                term channel_term = term_get_tuple_element(cmd, 2);
+
+                if (!term_is_binary(mac_term) || term_binary_size(mac_term) != ESP_NOW_ETH_ALEN) {
+                    send_call_reply(ctx, pid, ref,
+                        port_create_error_tuple(ctx, BADARG_ATOM));
+                    goto done;
+                }
+
+                if (!term_is_integer(channel_term)) {
+                    send_call_reply(ctx, pid, ref,
+                        port_create_error_tuple(ctx, BADARG_ATOM));
+                    goto done;
+                }
+
+                const uint8_t *peer_addr = (const uint8_t *)term_binary_data(mac_term);
+                uint8_t channel = (uint8_t)term_to_int(channel_term);
+
+                esp_now_peer_info_t peer = { 0 };
+                memcpy(peer.peer_addr, peer_addr, ESP_NOW_ETH_ALEN);
+                peer.channel = channel;
+                peer.ifidx = WIFI_IF_STA;
+                peer.encrypt = false;
+
+                esp_err_t err = esp_now_mod_peer(&peer);
+
+                if (err != ESP_OK) {
+                    send_call_reply(ctx, pid, ref,
+                        port_create_error_tuple(ctx, term_from_int(err)));
+                } else {
+                    send_call_reply(ctx, pid, ref, OK_ATOM);
+                }
+                goto done;
+            }
+        }
+
+        // {del_peer, Mac} - delete a peer
+        if (globalcontext_is_term_equal_to_atom_string(ctx->global, cmd_name, del_peer_atom_str)) {
+            if (term_get_tuple_arity(cmd) >= 2) {
+                term mac_term = term_get_tuple_element(cmd, 1);
+
+                if (!term_is_binary(mac_term) || term_binary_size(mac_term) != ESP_NOW_ETH_ALEN) {
+                    send_call_reply(ctx, pid, ref,
+                        port_create_error_tuple(ctx, BADARG_ATOM));
+                    goto done;
+                }
+
+                const uint8_t *peer_addr = (const uint8_t *)term_binary_data(mac_term);
+
+                esp_err_t err = esp_now_del_peer(peer_addr);
+
+                if (err != ESP_OK && err != ESP_ERR_ESPNOW_NOT_FOUND) {
+                    send_call_reply(ctx, pid, ref,
+                        port_create_error_tuple(ctx, term_from_int(err)));
+                } else {
+                    send_call_reply(ctx, pid, ref, OK_ATOM);
+                }
+                goto done;
+            }
+        }
+
+        // {peer_exists, Mac} - check if peer exists
+        if (globalcontext_is_term_equal_to_atom_string(ctx->global, cmd_name, peer_exists_atom_str)) {
+            if (term_get_tuple_arity(cmd) >= 2) {
+                term mac_term = term_get_tuple_element(cmd, 1);
+
+                if (!term_is_binary(mac_term) || term_binary_size(mac_term) != ESP_NOW_ETH_ALEN) {
+                    send_call_reply(ctx, pid, ref,
+                        port_create_error_tuple(ctx, BADARG_ATOM));
+                    goto done;
+                }
+
+                const uint8_t *peer_addr = (const uint8_t *)term_binary_data(mac_term);
+                bool exists = esp_now_is_peer_exist(peer_addr);
+
+                send_call_reply(ctx, pid, ref, exists ? TRUE_ATOM : FALSE_ATOM);
+                goto done;
+            }
+        }
     }
+
+    // Unknown command
+    send_call_reply(ctx, pid, ref,
+        port_create_error_tuple(ctx, BADARG_ATOM));
 
 done:
     mailbox_remove_message(&ctx->mailbox, &ctx->heap);
@@ -467,8 +589,8 @@ Context *atomvm_espnow_create_port(GlobalContext *global, term opts)
         return NULL;
     }
 
-    // Create event queue
-    s_event_queue = xQueueCreate(32, sizeof(espnow_event_t));
+    // Create event queue (16 entries is enough for most use cases)
+    s_event_queue = xQueueCreate(16, sizeof(espnow_event_t));
     if (!s_event_queue) {
         ESP_LOGE(TAG, "Failed to create event queue");
         return NULL;

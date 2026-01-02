@@ -10,6 +10,7 @@
 #include <globalcontext.h>
 #include <port.h>
 #include <term.h>
+#include <portnifloader.h>
 
 #include "atomvm_espnow.h"
 

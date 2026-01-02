@@ -17,7 +17,10 @@
     open/0, open/1,
     close/1,
     send/3,
-    add_peer/3
+    add_peer/3,
+    mod_peer/3,
+    del_peer/2,
+    peer_exists/2
 ]).
 
 %% @doc Open the ESPNOW port with default options (channel 0, owner = self()).
@@ -65,6 +68,21 @@ send(Port, To, Data) when is_port(Port), is_binary(Data) ->
 -spec add_peer(port(), binary(), non_neg_integer()) -> ok | {error, term()}.
 add_peer(Port, Mac, Channel) when is_port(Port), is_binary(Mac), byte_size(Mac) =:= 6, is_integer(Channel) ->
     gen_server_call(Port, {add_peer, Mac, Channel}).
+
+%% @doc Modify an existing peer's channel.
+-spec mod_peer(port(), binary(), non_neg_integer()) -> ok | {error, term()}.
+mod_peer(Port, Mac, Channel) when is_port(Port), is_binary(Mac), byte_size(Mac) =:= 6, is_integer(Channel) ->
+    gen_server_call(Port, {mod_peer, Mac, Channel}).
+
+%% @doc Delete a peer.
+-spec del_peer(port(), binary()) -> ok | {error, term()}.
+del_peer(Port, Mac) when is_port(Port), is_binary(Mac), byte_size(Mac) =:= 6 ->
+    gen_server_call(Port, {del_peer, Mac}).
+
+%% @doc Check if a peer exists.
+-spec peer_exists(port(), binary()) -> boolean() | {error, term()}.
+peer_exists(Port, Mac) when is_port(Port), is_binary(Mac), byte_size(Mac) =:= 6 ->
+    gen_server_call(Port, {peer_exists, Mac}).
 
 %% Internal: Simple gen_server:call style implementation for ports
 gen_server_call(Port, Request) ->
