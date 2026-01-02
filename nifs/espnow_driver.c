@@ -28,6 +28,15 @@ struct avm_espnow_handle {
 
 static const char *TAG = "atomvm_espnow";
 
+static const uint8_t broadcast_addr[ESP_NOW_ETH_ALEN] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+static inline bool is_broadcast_addr(const uint8_t *addr)
+{
+    return addr && memcmp(addr, broadcast_addr, ESP_NOW_ETH_ALEN) == 0;
+}
+
 // Current implementation supports a single active handle.
 static avm_espnow_handle_t *s_handle = NULL;
 
@@ -78,11 +87,10 @@ static void send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t st
     if (handle && handle->tx_queue) {
         avm_espnow_tx_t *tx = malloc(sizeof(avm_espnow_tx_t));
         if (tx) {
+            tx->is_broadcast = is_broadcast_addr(mac_addr);
             if (mac_addr) {
-                tx->is_broadcast = false;
                 memcpy(tx->dst_addr, mac_addr, ESP_NOW_ETH_ALEN);
             } else {
-                tx->is_broadcast = true;
                 memset(tx->dst_addr, 0, ESP_NOW_ETH_ALEN);
             }
             tx->status = tx_status;
@@ -93,7 +101,7 @@ static void send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t st
         }
     }
 
-    if (!mac_addr) {
+    if (is_broadcast_addr(mac_addr)) {
         ESP_LOGI(TAG, "TX broadcast status=%d", tx_status);
         return;
     }
@@ -192,6 +200,17 @@ esp_err_t avm_espnow_new(const avm_espnow_config_t *config, avm_espnow_handle_t 
     if (version < 2) {
         ESP_LOGW(TAG, "ESPNOW version %lu (need v2)", (unsigned long) version);
         return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    // Ensure broadcast peer exists so sending to FF:FF:FF:FF:FF:FF works.
+    esp_now_peer_info_t broadcast_peer = { 0 };
+    memcpy(broadcast_peer.peer_addr, broadcast_addr, ESP_NOW_ETH_ALEN);
+    broadcast_peer.channel = 0;
+    broadcast_peer.ifidx = WIFI_IF_STA;
+    broadcast_peer.encrypt = false;
+    esp_err_t peer_err = esp_now_add_peer(&broadcast_peer);
+    if (peer_err != ESP_OK && peer_err != ESP_ERR_ESPNOW_EXIST) {
+        return peer_err;
     }
 
     // Register callbacks (best-effort; ok if already registered).
@@ -353,5 +372,6 @@ esp_err_t avm_espnow_send(avm_espnow_handle_t *handle, const uint8_t *peer_addr_
         return ESP_ERR_INVALID_ARG;
     }
 
-    return esp_now_send(peer_addr_or_null, data, len);
+    const uint8_t *dst = peer_addr_or_null ? peer_addr_or_null : broadcast_addr;
+    return esp_now_send(dst, data, len);
 }
