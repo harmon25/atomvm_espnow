@@ -1,0 +1,9 @@
+menu "ATOMVM_ESPNOW Configuration"
+
+config AVM_ESPNOW_ENABLE
+	bool "Enable AtomVM ESPNOW driver"
+	default y
+	help
+		Enable the AtomVM ESPNOW native component.
+
+endmenu
