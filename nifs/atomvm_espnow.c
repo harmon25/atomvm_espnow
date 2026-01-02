@@ -9,6 +9,7 @@
 #include <context.h>
 #include <defaultatoms.h>
 #include <nifs.h>
+#include <portnifloader.h>
 #include <term.h>
 
 #include "atomvm_espnow.h"
@@ -305,6 +306,11 @@ void atomvm_espnow_init(GlobalContext *global)
     UNUSED(global);
 }
 
+void atomvm_espnow_destroy(GlobalContext *global)
+{
+    UNUSED(global);
+}
+
 const struct Nif *atomvm_espnow_get_nif(const char *nifname)
 {
     if (strcmp("espnow:nif_init/1", nifname) == 0) {
@@ -330,5 +336,5 @@ const struct Nif *atomvm_espnow_get_nif(const char *nifname)
 
 #include <sdkconfig.h>
 #ifdef CONFIG_AVM_ESPNOW_ENABLE
-REGISTER_NIF_COLLECTION(atomvm_espnow, atomvm_espnow_init, NULL, atomvm_espnow_get_nif)
+REGISTER_NIF_COLLECTION(atomvm_espnow, atomvm_espnow_init, atomvm_espnow_destroy, atomvm_espnow_get_nif)
 #endif
