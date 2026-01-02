@@ -25,6 +25,9 @@ ok = espnow:add_peer(Port, Mac, Channel).
 ok = espnow:mod_peer(Port, Mac, NewChannel).
 ok = espnow:del_peer(Port, Mac).
 true | false = espnow:peer_exists(Port, Mac).
+
+%% Channel info
+Channel = espnow:get_channel(Port).
 ```
 
 ### Messages
@@ -42,6 +45,31 @@ The owner process receives async messages:
 |--------|---------|-------------|
 | `{channel, 0..14}` | `0` | WiFi channel (0 = don't change) |
 | `{owner, pid()}` | `self()` | Process to receive RX/TX messages |
+
+## WiFi Coexistence
+
+ESP-NOW and WiFi networking can work simultaneously - they share the same radio hardware.
+
+### Channel Constraints
+
+⚠️ **Important**: When connected to a WiFi access point, ESP-NOW operates on the AP's channel. The channel cannot be changed while connected.
+
+| Scenario | Channel Behavior |
+|----------|------------------|
+| ESP-NOW only | Can freely set channel via `{channel, N}` option |
+| Connected to AP (STA) | **Channel locked** to AP's channel |
+| Soft-AP mode | Channel from AP config |
+| STA + AP mode | Station channel takes priority |
+
+### Best Practices
+
+1. **Use channel 0 for peers** when connected to an AP - this auto-uses the current channel
+2. **Query current channel** with `espnow:get_channel/1` to see what channel you're on
+3. **Set explicit channel** only when running ESP-NOW standalone (not connected to WiFi)
+
+### Cooperation with AtomVM Network
+
+This driver automatically detects if WiFi has already been initialized by AtomVM's network module. If WiFi is running, it will reuse the existing configuration rather than reinitializing.
 
 ## Requirements
 

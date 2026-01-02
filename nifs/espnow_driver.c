@@ -45,6 +45,7 @@ static const char *const add_peer_atom_str = "\x8" "add_peer";
 static const char *const mod_peer_atom_str = "\x8" "mod_peer";
 static const char *const del_peer_atom_str = "\x8" "del_peer";
 static const char *const peer_exists_atom_str = "\xB" "peer_exists";
+static const char *const get_channel_atom_str = "\xB" "get_channel";
 
 static const uint8_t broadcast_addr[ESP_NOW_ETH_ALEN] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
@@ -155,9 +156,38 @@ static void send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t st
 // WiFi/ESPNOW Initialization
 //
 
+// Track whether we initialized WiFi ourselves
+static bool s_wifi_initialized_by_us = false;
+
 static esp_err_t ensure_wifi_started(uint8_t channel)
 {
-    esp_err_t err = nvs_flash_init();
+    esp_err_t err;
+
+    // Check if WiFi is already initialized (e.g., by AtomVM network driver)
+    wifi_mode_t current_mode;
+    err = esp_wifi_get_mode(&current_mode);
+    if (err == ESP_OK) {
+        // WiFi is already running - don't reinitialize
+        ESP_LOGI(TAG, "WiFi already initialized (mode=%d), reusing", (int)current_mode);
+        
+        // If channel specified and we're not connected to an AP, try to set it
+        // Note: This will fail if STA is connected - that's expected
+        if (channel != 0) {
+            err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Could not set channel %d (err=%d) - using current channel", 
+                    (int)channel, (int)err);
+                // This is not fatal - we'll use the current channel
+            }
+        }
+        return ESP_OK;
+    }
+
+    // WiFi not initialized - we need to set it up
+    ESP_LOGI(TAG, "Initializing WiFi for ESP-NOW");
+    s_wifi_initialized_by_us = true;
+
+    err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
@@ -200,7 +230,8 @@ static esp_err_t ensure_wifi_started(uint8_t channel)
     if (channel != 0) {
         err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
         if (err != ESP_OK) {
-            return err;
+            ESP_LOGW(TAG, "Could not set channel %d (err=%d)", (int)channel, (int)err);
+            // Not fatal
         }
     }
 
@@ -541,6 +572,21 @@ static NativeHandlerResult espnow_consume_mailbox(Context *ctx)
                 send_call_reply(ctx, pid, ref, exists ? TRUE_ATOM : FALSE_ATOM);
                 goto done;
             }
+        }
+
+        // get_channel - return current WiFi channel
+        if (globalcontext_is_term_equal_to_atom_string(ctx->global, cmd_name, get_channel_atom_str)) {
+            uint8_t primary = 0;
+            wifi_second_chan_t secondary = WIFI_SECOND_CHAN_NONE;
+            esp_err_t err = esp_wifi_get_channel(&primary, &secondary);
+            
+            if (err != ESP_OK) {
+                send_call_reply(ctx, pid, ref,
+                    port_create_error_tuple(ctx, term_from_int(err)));
+            } else {
+                send_call_reply(ctx, pid, ref, term_from_int(primary));
+            }
+            goto done;
         }
     }
 

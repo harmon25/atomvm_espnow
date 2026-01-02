@@ -20,7 +20,8 @@
     add_peer/3,
     mod_peer/3,
     del_peer/2,
-    peer_exists/2
+    peer_exists/2,
+    get_channel/1
 ]).
 
 %% @doc Open the ESPNOW port with default options (channel 0, owner = self()).
@@ -83,6 +84,13 @@ del_peer(Port, Mac) when is_port(Port), is_binary(Mac), byte_size(Mac) =:= 6 ->
 -spec peer_exists(port(), binary()) -> boolean() | {error, term()}.
 peer_exists(Port, Mac) when is_port(Port), is_binary(Mac), byte_size(Mac) =:= 6 ->
     gen_server_call(Port, {peer_exists, Mac}).
+
+%% @doc Get the current WiFi channel.
+%% Returns the primary channel number (1-14).
+%% Note: When connected to an AP, channel is locked to the AP's channel.
+-spec get_channel(port()) -> non_neg_integer() | {error, term()}.
+get_channel(Port) when is_port(Port) ->
+    gen_server_call(Port, get_channel).
 
 %% Internal: Simple gen_server:call style implementation for ports
 gen_server_call(Port, Request) ->
